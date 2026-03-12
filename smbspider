@@ -1,0 +1,1049 @@
+#!/bin/bash
+
+# ================= SMBSpider - SMART SMB TOOL =================
+# Colors
+RED='\033[0;31m'
+GRN='\033[0;32m'
+YEL='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+PURPLE='\033[0;35m'
+RESET='\033[0m'
+BOLD='\033[1m'
+
+# ================= GLOBALS =================
+TARGET=""
+USER=""
+PASS=""
+DOMAIN=""
+HASH=""
+NULL_SESSION=0
+OUTPUT=""
+
+# Operations
+OPERATION="none"
+SHARE_NAME=""
+SHARE_PATH=""
+DOWNLOAD_PATH=""
+UPLOAD_SOURCE=""
+UPLOAD_DEST_PATH=""
+DO_RESOLVE=0
+
+# ================= FUNCTIONS =================
+
+print_banner() {
+    echo -e "${BOLD}${BLUE}╔════════════════════════════════════╗${RESET}"
+    echo -e "${BOLD}${BLUE}║     SMBSpider - Smart SMB Tool     ║${RESET}"
+    echo -e "${BOLD}${BLUE}║    Intelligently handles SMB ops   ║${RESET}"
+    echo -e "${BOLD}${BLUE}╚════════════════════════════════════╝${RESET}\n"
+}
+
+print_help() {
+    echo -e "\n${BOLD}${CYAN}📌 USAGE:${RESET}"
+    echo "  $0 <target> [options]"
+    echo "  $0 -h | --help     Show this help"
+    echo
+    echo -e "${BOLD}${YEL}🎯 OPERATIONS:${RESET}"
+    echo "  -s [share/path]  List shares or share contents (supports subpaths)"
+    echo "  -i [share]       Interactive mode (menu or direct)"
+    echo "  -get <path>      Download file (e.g., -get share/file.txt)"
+    echo "  -up <src> <dest> Upload file (e.g., -up test.txt /HR/Pass/pass.txt)"
+    echo "  -r               Resolve hostname"
+    echo
+    echo -e "${BOLD}${YEL}🔐 AUTH:${RESET}"
+    echo "  -u <user>      Username"
+    echo "  -p <pass>      Password"
+    echo "  -d <domain>    Domain"
+    echo "  -n             Null session"
+    echo "  -o <file>      Save output (overwrites if exists)"
+    echo
+    echo -e "${BOLD}${YEL}🔑 PASS-THE-HASH:${RESET}"
+    echo "  -H <hash>      Any format works automatically:"
+    echo "                  • NT hash only:        -H 123...abc"
+    echo "                  • LM:NT format:        -H aad3...:123...abc"
+    echo "                  • With colon only:     -H :123...abc"
+    echo
+    echo -e "${BOLD}${YEL}💡 EXAMPLES:${RESET}"
+    echo "  $0 192.168.1.100                   # Check port only"
+    echo "  $0 192.168.1.100 -r                # Check port + resolve"
+    echo "  $0 192.168.1.100 -s                # List shares"
+    echo "  $0 192.168.1.100 -s HR             # List data share root"
+    echo "  $0 192.168.1.100 -s HR/Pass        # List SHER/Desktop folder"
+    echo "  $0 192.168.1.100 -i                # Interactive menu"
+    echo "  $0 192.168.1.100 -i HR             # Direct to data"
+    echo
+    echo "  $0 192.168.1.100 -get HR/pass.txt                 # Download file"
+    echo "  $0 192.168.1.100 -get /HR/Pass/pass.txt           # Download file"
+    echo "  $0 192.168.1.100 -up fake_pass /HR/Pass/          # Same as above"
+    echo "  $0 192.168.1.100 -up fake_pass /HR/Pass/pass.txt  # Upload with new name"
+    echo
+    echo -e "${BOLD}${YEL}🔑 HASH EXAMPLES:${RESET}"
+    echo "  $0 192.168.1.100 -u admin -H LM:NT -s"
+    echo "  $0 192.168.1.100 -u admin -H :123abc -s"
+    echo "  $0 192.168.1.100 -u admin -H 123...abc -s"
+    echo
+    echo -e "${YEL}🔹 Paths auto-cleaned: ///share//file.txt works${RESET}"
+    echo -e "${YEL}🔹 Leading slashes are automatically removed${RESET}"
+    echo -e "${YEL}🔹 -o overwrites existing output file${RESET}"
+}
+
+# ================= UTILITIES =================
+clean_path() {
+    local path="$1"
+    # Remove leading/trailing slashes and normalize multiple slashes
+    echo "$path" | sed 's#^/*##; s#/*$##; s#//*#/#g'
+}
+
+clean_share() {
+    local share="$1"
+    echo "$share" | sed 's#/##g'
+}
+
+format_smb_url() {
+    local ip="$1"
+    local share="$2"
+    local path="$3"
+    
+    if [ -n "$path" ]; then
+        echo "smb://$ip/$share/$path"
+    elif [ -n "$share" ]; then
+        echo "smb://$ip/$share/"
+    else
+        echo "smb://$ip/"
+    fi
+}
+
+print_error() { echo -e "${RED}[-] $1${RESET}"; }
+print_success() { echo -e "${GRN}[+] $1${RESET}"; }
+print_info() { echo -e "${YEL}[*] $1${RESET}"; }
+print_warning() { echo -e "${YEL}[!] $1${RESET}"; }
+
+# ================= AUTHENTICATION - SUPPORTS ALL HASH FORMATS =================
+build_auth() {
+    # SMART RULE: If auth credentials exist, ignore null session
+    if [ "$NULL_SESSION" = "1" ] && [ -n "$USER" -o -n "$HASH" -o -n "$PASS" ]; then
+        NULL_SESSION=0
+    fi
+    
+    # Pass-the-Hash - Supports ALL formats
+    if [ -n "$HASH" ] && [ -n "$USER" ]; then
+        local nt_hash=""
+        local lm_hash=""
+        
+        # Format 1: "LM:NT" (full format)
+        if [[ "$HASH" == *":"* ]] && [[ "$HASH" != ":"* ]]; then
+            lm_hash=$(echo "$HASH" | cut -d':' -f1)
+            nt_hash=$(echo "$HASH" | cut -d':' -f2-)
+        
+        # Format 2: ":NT" (colon at start)
+        elif [[ "$HASH" == ":"* ]]; then
+            lm_hash=""
+            nt_hash=$(echo "$HASH" | cut -d':' -f2-)
+        
+        # Format 3: NT only (no colon)
+        else
+            lm_hash=""
+            nt_hash="$HASH"
+        fi
+        
+        # Clean up hash (remove any spaces)
+        nt_hash=$(echo "$nt_hash" | tr -d ' ')
+        
+        # Build auth string for smbclient
+        if [ -n "$DOMAIN" ]; then
+            echo "-U \"$DOMAIN\\\\$USER\" --pw-nt-hash -p $nt_hash"
+        else
+            echo "-U \"$USER\" --pw-nt-hash -p $nt_hash"
+        fi
+        return
+    fi
+    
+    # Normal auth with password
+    if [ -n "$USER" ] && [ -n "$PASS" ]; then
+        if [ -n "$DOMAIN" ]; then
+            echo "-U \"$DOMAIN\\\\$USER%$PASS\""
+        else
+            echo "-U \"$USER%$PASS\""
+        fi
+        return
+    fi
+    
+    # Username only (will prompt for password)
+    if [ -n "$USER" ]; then
+        if [ -n "$DOMAIN" ]; then
+            echo "-U \"$DOMAIN\\\\$USER\""
+        else
+            echo "-U \"$USER\""
+        fi
+        return
+    fi
+    
+    # Null session or no auth
+    if [ "$NULL_SESSION" = "1" ]; then
+        echo "-N"
+    else
+        echo "-N"  # Will try anonymous
+    fi
+}
+
+# ================= CHECK REMOTE FILE/FOLDER EXISTS =================
+check_remote_file() {
+    local share="$1"
+    local file="$2"
+    local auth=$(build_auth)
+    
+    # Extract directory and filename
+    local dir=$(dirname "$file")
+    local filename=$(basename "$file")
+    
+    # If dir is ".", then it's the root of the share
+    if [ "$dir" = "." ]; then
+        dir=""
+    fi
+    
+    # Build command to list the directory containing the file
+    local list_cmd="ls"
+    if [ -n "$dir" ]; then
+        list_cmd="cd \"$dir\"; ls"
+    fi
+    
+    # Execute smbclient to list the directory
+    local output=$(eval smbclient "//$TARGET/$share" $auth -c "$list_cmd" 2>&1)
+    local exit_code=$?
+    
+    # Check for specific errors
+    if echo "$output" | grep -qi "NT_STATUS_LOGON_FAILURE"; then
+        return 5  # Login failed
+    elif echo "$output" | grep -qi "NT_STATUS_ACCESS_DENIED"; then
+        return 2  # Access denied to list directory
+    elif echo "$output" | grep -qi "NT_STATUS_BAD_NETWORK_NAME"; then
+        return 3  # Share not found
+    elif echo "$output" | grep -qi "NT_STATUS_OBJECT_NAME_NOT_FOUND"; then
+        if [ -n "$dir" ] && [ "$dir" != "." ]; then
+            return 1  # Directory doesn't exist
+        fi
+        return 1
+    elif echo "$output" | grep -qi "NT_STATUS_NO_SUCH_FILE"; then
+        return 1  # File does not exist
+    fi
+    
+    # If the command itself failed for other reasons
+    if [ $exit_code -ne 0 ]; then
+        if echo "$output" | grep -qi "NT_STATUS_OBJECT_NAME_NOT_FOUND"; then
+            return 1
+        elif echo "$output" | grep -qi "NT_STATUS_NOT_FOUND"; then
+            return 1
+        else
+            return 1
+        fi
+    fi
+    
+    # Now check if our specific file is in the listing
+    if echo "$output" | grep -qi "^$filename[[:space:]]"; then
+        # File found in listing
+        if echo "$output" | grep -qi "^$filename[[:space:]].*D"; then
+            return 4  # Is a directory
+        else
+            return 0  # File exists
+        fi
+    else
+        # File not found in listing
+        return 1  # File does not exist
+    fi
+}
+
+# ================= CHECK IF PATH IS A DIRECTORY =================
+check_is_directory() {
+    local share="$1"
+    local path="$2"
+    local auth=$(build_auth)
+    
+    # If path is empty, it's the root (always a directory)
+    if [ -z "$path" ]; then
+        return 0
+    fi
+    
+    # Try to list the path as a directory
+    local output=$(eval smbclient "//$TARGET/$share" $auth -c "cd \"$path\"; ls" 2>&1)
+    local exit_code=$?
+    
+    if echo "$output" | grep -qi "NT_STATUS_NOT_A_DIRECTORY"; then
+        return 1  # Not a directory
+    elif echo "$output" | grep -qi "NT_STATUS_OBJECT_NAME_NOT_FOUND"; then
+        return 2  # Doesn't exist
+    elif echo "$output" | grep -qi "NT_STATUS_ACCESS_DENIED"; then
+        return 3  # Access denied
+    elif echo "$output" | grep -qi "NT_STATUS_LOGON_FAILURE"; then
+        return 5  # Login failed
+    elif echo "$output" | grep -qi "NT_STATUS_BAD_NETWORK_NAME"; then
+        return 3  # Share not found
+    fi
+    
+    # If we got a listing without errors, it's a directory
+    if [ $exit_code -eq 0 ] && ! echo "$output" | grep -qi "NT_STATUS"; then
+        return 0  # Is a directory
+    fi
+    
+    # Default: assume not a directory
+    return 1
+}
+
+# ================= CORE FUNCTIONS =================
+
+check_port() {
+    print_info "Checking SMB on $TARGET..."
+    if timeout 2 bash -c "echo >/dev/tcp/$TARGET/445" 2>/dev/null; then
+        print_success "Port 445 is open"
+        echo -e "  $(format_smb_url "$TARGET")"
+        return 0
+    else
+        print_error "Port 445 is closed"
+        return 1
+    fi
+}
+
+resolve_hostname() {
+    print_info "Resolving hostname..."
+    if command -v nmblookup &>/dev/null; then
+        local name=$(nmblookup -A "$TARGET" 2>/dev/null | grep -E '<00>' | grep -v 'GROUP' | head -1 | awk '{print $1}')
+        if [ -n "$name" ]; then
+            print_success "NetBIOS name: $name"
+            echo -e "  $(format_smb_url "$name")"
+        fi
+    fi
+}
+
+list_shares() {
+    print_info "Fetching shares from $TARGET..."
+    local auth=$(build_auth)
+    local cmd="smbclient -L \"//$TARGET\" $auth"
+    
+    local output=$(eval $cmd 2>&1)
+    
+    if echo "$output" | grep -q "NT_STATUS_LOGON_FAILURE"; then
+        print_error "Login failed"
+        return 1
+    fi
+    
+    echo -e "\n${BOLD}${CYAN}Available Shares:${RESET}\n"
+    local count=0
+    local in_share=0
+    
+    while IFS= read -r line; do
+        if [[ "$line" == *"Sharename"* ]] && [[ "$line" == *"Type"* ]]; then
+            in_share=1
+            continue
+        fi
+        
+        if [ $in_share -eq 1 ] && [ -n "$line" ]; then
+            [[ "$line" == *"--"* ]] && continue
+            
+            if [[ "$line" == *"Disk"* ]]; then
+                share=$(echo "$line" | awk '{print $1}')
+                if [ -n "$share" ] && [ "$share" != "Disk" ]; then
+                    smb_url=$(format_smb_url "$TARGET" "$share")
+                    echo -e "  ${GRN}📁 $smb_url${RESET}"
+                    ((count++))
+                fi
+            fi
+        fi
+        
+        [[ "$line" == *"blocks"* ]] && in_share=0
+    done <<< "$output"
+    
+    [ $count -eq 0 ] && echo "  No shares found"
+}
+
+list_content() {
+    local input="$SHARE_NAME"
+    local share=""
+    local path=""
+    
+    # Parse share and path
+    if [[ "$input" == *"/"* ]]; then
+        share=$(echo "$input" | cut -d'/' -f1)
+        path=$(echo "$input" | cut -d'/' -f2-)
+    else
+        share="$input"
+        path=""
+    fi
+    
+    share=$(clean_share "$share")
+    path=$(clean_path "$path")
+    
+    if [ -n "$path" ]; then
+        print_info "Listing $(format_smb_url "$TARGET" "$share" "$path/") ..."
+    else
+        print_info "Listing $(format_smb_url "$TARGET" "$share") ..."
+    fi
+    echo
+    
+    local auth=$(build_auth)
+    local cmd="smbclient \"//$TARGET/$share\" $auth"
+    
+    if [ -n "$path" ]; then
+        cmd="$cmd -c \"cd \\\"$path\\\"; ls\""
+    else
+        cmd="$cmd -c \"ls\""
+    fi
+    
+    local output=$(eval $cmd 2>&1)
+    
+    if echo "$output" | grep -q "NT_STATUS_ACCESS_DENIED"; then
+        print_error "Access denied to $share"
+        return 1
+    fi
+    
+    if echo "$output" | grep -q "NT_STATUS_BAD_NETWORK_NAME"; then
+        print_error "Share '$share' not found"
+        return 1
+    fi
+    
+    if echo "$output" | grep -q "NT_STATUS_OBJECT_NAME_NOT_FOUND"; then
+        print_error "Path '$path' not found in share '$share'"
+        return 1
+    fi
+    
+    if echo "$output" | grep -q "NT_STATUS_LOGON_FAILURE"; then
+        print_error "Login failed"
+        return 1
+    fi
+    
+    # Display contents
+    local files=0; local dirs=0
+    
+    while IFS= read -r line; do
+        [[ "$line" =~ blocks ]] && continue
+        [[ -z "$line" ]] && continue
+        
+        name=$(echo "$line" | awk '{print $1}')
+        [[ "$name" == "." || "$name" == ".." ]] && continue
+        
+        if [[ "$line" == *" D "* ]]; then
+            if [ -n "$path" ]; then
+                smb_url=$(format_smb_url "$TARGET" "$share" "$path/$name/")
+            else
+                smb_url=$(format_smb_url "$TARGET" "$share" "$name/")
+            fi
+            echo -e "  ${CYAN}📂 $smb_url${RESET}"
+            ((dirs++))
+        else
+            size=$(echo "$line" | awk '{print $3}')
+            if [ -n "$path" ]; then
+                smb_url=$(format_smb_url "$TARGET" "$share" "$path/$name")
+            else
+                smb_url=$(format_smb_url "$TARGET" "$share" "$name")
+            fi
+            
+            if [[ "$size" =~ ^[0-9]+$ ]]; then
+                if command -v numfmt &>/dev/null; then
+                    size_hr=$(numfmt --to=iec "$size")
+                else
+                    if [ $size -gt 1048576 ]; then
+                        size_hr="$((size/1048576))MB"
+                    elif [ $size -gt 1024 ]; then
+                        size_hr="$((size/1024))KB"
+                    else
+                        size_hr="${size}B"
+                    fi
+                fi
+                echo -e "  ${GRN}📄 $smb_url${RESET} ${YEL}($size_hr)${RESET}"
+            else
+                echo -e "  ${GRN}📄 $smb_url${RESET}"
+            fi
+            ((files++))
+        fi
+    done <<< "$output"
+    
+    echo -e "\n${CYAN}📊 $dirs directories, $files files${RESET}"
+}
+
+# ================= DOWNLOAD FUNCTION =================
+download_file() {
+    local path="$DOWNLOAD_PATH"
+    
+    # Remove leading slash if exists
+    path=$(echo "$path" | sed 's#^/##')
+    
+    # Extract share and file path
+    local share=$(echo "$path" | cut -d'/' -f1)
+    local file=$(echo "$path" | cut -d'/' -f2-)
+    
+    # Get filename from the end of path
+    local filename=$(basename "$file")
+    local local_path="./$filename" # Download to current directory with original name
+    
+    smb_url=$(format_smb_url "$TARGET" "$share" "$file")
+    print_info "Downloading: $smb_url"
+    print_info "Local target: $local_path"
+
+    # Check if destination is a directory (should not happen with our usage, but for safety)
+    if [ -d "$local_path" ]; then
+        print_error "Destination '$local_path' exists and is a directory. Cannot overwrite with file."
+        return 1
+    fi
+
+    # Check if file already exists locally
+    if [ -f "$local_path" ]; then
+        while true; do
+            echo -n -e "${YEL}File '$local_path' exists locally. Overwrite? (y/n): ${RESET}"
+            read -r response
+            
+            if [[ "$response" =~ ^[Yy]$ ]]; then
+                rm -f "$local_path"
+                break
+            elif [[ "$response" =~ ^[Nn]$ ]]; then
+                print_warning "Download cancelled"
+                return 1
+            else
+                print_error "Please enter 'y' or 'n'"
+            fi
+        done
+    fi
+    
+    local auth=$(build_auth)
+    
+    # Create a temporary file for output to avoid partial downloads
+    local temp_file="${local_path}.tmp"
+    
+    # Ensure any old temp file is removed
+    rm -f "$temp_file"
+    
+    local smbclient_cmd="smbclient \"//$TARGET/$share\" $auth -c \"get \\\"$file\\\" \\\"$temp_file\\\"\" 2>&1"
+    
+    # Execute the command and capture output and exit code
+    local output
+    output=$(eval "$smbclient_cmd")
+    local result=$?
+    
+    # Check for specific errors in the output regardless of exit code
+    if echo "$output" | grep -qi "NT_STATUS_ACCESS_DENIED"; then
+        print_error "Download failed: Access Denied. You don't have permission to read this file."
+        rm -f "$temp_file" 2>/dev/null
+        return 1
+    elif echo "$output" | grep -qi "NT_STATUS_OBJECT_NAME_NOT_FOUND"; then
+        print_error "Download failed: File not found. The path '$file' does not exist in share '$share'."
+        rm -f "$temp_file" 2>/dev/null
+        return 1
+    elif echo "$output" | grep -qi "NT_STATUS_BAD_NETWORK_NAME"; then
+        print_error "Download failed: Share '$share' not found on the target."
+        rm -f "$temp_file" 2>/dev/null
+        return 1
+    elif echo "$output" | grep -qi "NT_STATUS_LOGON_FAILURE"; then
+        print_error "Download failed: Login failed. Check your username, password, or hash."
+        rm -f "$temp_file" 2>/dev/null
+        return 1
+    elif echo "$output" | grep -qi "NT_STATUS_FILE_IS_A_DIRECTORY"; then
+        print_error "Download failed: The specified path is a directory, not a file. Use -s to list contents."
+        rm -f "$temp_file" 2>/dev/null
+        return 1
+    elif echo "$output" | grep -qi "NT_STATUS_OBJECT_PATH_NOT_FOUND"; then
+        print_error "Download failed: One or more parent directories in the path '$file' do not exist."
+        rm -f "$temp_file" 2>/dev/null
+        return 1
+    fi
+    
+    # If we got this far, check if the command succeeded and the temp file exists and has content
+    if [ $result -eq 0 ] && [ -f "$temp_file" ] && [ -s "$temp_file" ]; then
+        mv "$temp_file" "$local_path"
+        local size=$(du -h "$local_path" 2>/dev/null | cut -f1)
+        print_success "Download completed successfully: $filename ($size)"
+        return 0
+    else
+        # Generic failure
+        rm -f "$temp_file" 2>/dev/null
+        print_error "Download failed for an unknown reason."
+        echo "Debug - smbclient output: $output"
+        return 1
+    fi
+}
+
+# ================= UPLOAD FUNCTION (FIXED) =================
+upload_file() {
+    local src_file="$UPLOAD_SOURCE"
+    local dest_path="$UPLOAD_DEST_PATH"
+    
+    # Check if source file exists locally
+    if [ ! -f "$src_file" ]; then
+        print_error "Local file not found: $src_file"
+        return 1
+    fi
+    
+    # Clean destination path - remove leading slash but KEEP trailing slash info
+    local original_dest="$dest_path"
+    dest_path=$(echo "$dest_path" | sed 's#^/*##')
+    
+    # Check if destination ends with slash (even after cleaning)
+    local ends_with_slash=0
+    if [[ "$original_dest" == */ ]] || [[ "$dest_path" == */ ]]; then
+        ends_with_slash=1
+        # Remove trailing slash for processing
+        dest_path=$(echo "$dest_path" | sed 's#/*$##')
+    fi
+    
+    # Extract share and destination path
+    local share=$(echo "$dest_path" | cut -d'/' -f1)
+    local dest_remainder=$(echo "$dest_path" | cut -d'/' -f2-)
+    
+    # Get source filename
+    local src_filename=$(basename "$src_file")
+    
+    # Determine the final destination filename and path
+    local final_filename=""
+    local final_dir=""
+    
+    # If destination ends with slash, it's definitely a directory
+    if [ $ends_with_slash -eq 1 ]; then
+        # Ends with slash - treat as directory, use original filename
+        final_dir="$dest_remainder"
+        final_filename="$src_filename"
+        print_info "Destination ends with '/', treating as directory"
+    else
+        # No trailing slash - need to determine if the last part is part of a file path or directory
+        if [ -z "$dest_remainder" ]; then
+            # dest_remainder is empty - means we're at share root
+            final_dir=""
+            final_filename="$src_filename"
+        else
+            # Split the remainder into directory path and possible filename
+            # The last segment could be a filename or a directory
+            local last_segment=$(basename "$dest_remainder")
+            local path_before_last=$(dirname "$dest_remainder")
+            
+            if [ "$path_before_last" = "." ]; then
+                path_before_last=""
+            fi
+            
+            # Check if the last segment exists and what it is
+            check_remote_file "$share" "$dest_remainder"
+            local check_result=$?
+            
+            if [ $check_result -eq 0 ]; then
+                # Last segment exists as a FILE
+                # This means the user specified a full path including filename
+                final_dir="$path_before_last"
+                final_filename="$last_segment"
+                print_info "Destination includes filename (file exists)"
+            elif [ $check_result -eq 4 ]; then
+                # Last segment exists as a DIRECTORY
+                # User specified a directory, use original filename inside it
+                final_dir="$dest_remainder"
+                final_filename="$src_filename"
+                print_info "Destination is an existing directory"
+            else
+                # Last segment doesn't exist - need to determine intent
+                # Check if the path before last exists as a directory
+                if [ -n "$path_before_last" ]; then
+                    check_is_directory "$share" "$path_before_last"
+                    local parent_check=$?
+                    
+                    if [ $parent_check -eq 0 ]; then
+                        # Parent exists as directory - treat last segment as filename
+                        final_dir="$path_before_last"
+                        final_filename="$last_segment"
+                        print_info "Parent directory exists, treating last segment as filename"
+                    else
+                        # Parent doesn't exist - treat entire remainder as directory and create it
+                        final_dir="$dest_remainder"
+                        final_filename="$src_filename"
+                        print_info "Path doesn't exist, treating as directory to be created"
+                    fi
+                else
+                    # No parent path - just a single segment in the share
+                    # Treat it as a filename at the share root
+                    final_dir=""
+                    final_filename="$last_segment"
+                    print_info "Single segment at share root, treating as filename"
+                fi
+            fi
+        fi
+    fi
+    
+    # Clean up final_dir (remove any leading/trailing slashes)
+    final_dir=$(echo "$final_dir" | sed 's#^/*##; s#/*$##')
+    
+    # Build the full remote path for display and checking
+    if [ -n "$final_dir" ]; then
+        remote_full_path="$share/$final_dir/$final_filename"
+        remote_file_for_check="$final_dir/$final_filename"
+    else
+        remote_full_path="$share/$final_filename"
+        remote_file_for_check="$final_filename"
+    fi
+    
+    smb_url=$(format_smb_url "$TARGET" "$share" "$final_dir/$final_filename")
+    print_info "Uploading: $src_file → $smb_url"
+    
+    # Check if file already exists remotely
+    check_remote_file "$share" "$remote_file_for_check"
+    local remote_check=$?
+    
+    if [ $remote_check -eq 0 ]; then
+        # File exists
+        while true; do
+            echo -n -e "${YEL}File '$final_filename' exists remotely at ${final_dir:-root of share}. Overwrite? (y/n): ${RESET}"
+            read -r response
+            
+            if [[ "$response" =~ ^[Yy]$ ]]; then
+                break
+            elif [[ "$response" =~ ^[Nn]$ ]]; then
+                print_warning "Upload cancelled"
+                return
+            else
+                print_error "Please enter 'y' or 'n'"
+            fi
+        done
+    elif [ $remote_check -eq 4 ]; then
+        # Path exists but is a directory - this shouldn't happen with our improved logic
+        print_error "Destination path exists as a directory. Cannot overwrite directory with file."
+        return 1
+    fi
+    
+    # Proceed with upload
+    local auth=$(build_auth)
+    
+    # Build smbclient command for upload
+    local smbclient_cmd=""
+    if [ -n "$final_dir" ]; then
+        # Ensure directory exists (try to create if it doesn't)
+        # First check if directory exists
+        check_is_directory "$share" "$final_dir"
+        local dir_exists=$?
+        
+        if [ $dir_exists -eq 2 ]; then
+            # Directory doesn't exist, try to create it
+            print_info "Directory doesn't exist, attempting to create: $final_dir"
+            
+            # Create directory structure recursively
+            local current_path=""
+            IFS='/' read -ra dir_parts <<< "$final_dir"
+            for part in "${dir_parts[@]}"; do
+                if [ -n "$current_path" ]; then
+                    current_path="$current_path/$part"
+                else
+                    current_path="$part"
+                fi
+                
+                # Check if this part exists
+                check_is_directory "$share" "$current_path"
+                if [ $? -eq 2 ]; then
+                    local mkdir_cmd="mkdir \"$current_path\""
+                    eval smbclient "//$TARGET/$share" $auth -c "$mkdir_cmd" >/dev/null 2>&1
+                fi
+            done
+        fi
+        
+        # Now upload with cd to directory
+        smbclient_cmd="smbclient \"//$TARGET/$share\" $auth -c \"cd \\\"$final_dir\\\"; put \\\"$src_file\\\" \\\"$final_filename\\\"\""
+    else
+        # Upload to root of share
+        smbclient_cmd="smbclient \"//$TARGET/$share\" $auth -c \"put \\\"$src_file\\\" \\\"$final_filename\\\"\""
+    fi
+    
+    local output=$(eval "$smbclient_cmd" 2>&1)
+    local result=$?
+    
+    if [ $result -eq 0 ]; then
+        local size=$(du -h "$src_file" 2>/dev/null | cut -f1)
+        print_success "Uploaded: $final_filename ($size)"
+        return 0
+    else
+        print_error "Upload failed"
+        if echo "$output" | grep -q "NT_STATUS_ACCESS_DENIED"; then
+            echo "  → No write permission"
+        elif echo "$output" | grep -q "NT_STATUS_BAD_NETWORK_NAME"; then
+            echo "  → Share '$share' not found"
+        elif echo "$output" | grep -q "NT_STATUS_LOGON_FAILURE"; then
+            echo "  → Login failed"
+        elif echo "$output" | grep -q "NT_STATUS_OBJECT_NAME_COLLISION"; then
+            echo "  → Object name collision"
+        elif echo "$output" | grep -q "NT_STATUS_NOT_A_DIRECTORY"; then
+            echo "  → Path exists but is not a directory"
+        fi
+        return 1
+    fi
+}
+
+# ================= INTERACTIVE MODE =================
+interactive_mode() {
+    local auth=$(build_auth)
+    
+    # If we have a share name, use it directly
+    if [ -n "$SHARE_NAME" ]; then
+        local share=$(clean_share "$SHARE_NAME")
+        smb_url=$(format_smb_url "$TARGET" "$share")
+        print_info "Connecting to $smb_url..."
+        echo -e "${YEL}Type 'help' for commands, 'exit' to quit${RESET}\n"
+        
+        local cmd="smbclient \"//$TARGET/$share\" $auth"
+        eval $cmd
+        return
+    fi
+    
+    # No share specified, show menu
+    print_info "Fetching available shares..."
+    
+    # Get shares list
+    local output=$(eval smbclient -L "//$TARGET" $auth 2>&1)
+    
+    # Check for errors
+    if echo "$output" | grep -q "NT_STATUS_LOGON_FAILURE"; then
+        print_error "Login failed"
+        return 1
+    fi
+    
+    # Parse shares
+    local shares=()
+    local in_share=0
+    
+    while IFS= read -r line; do
+        if [[ "$line" == *"Sharename"* ]] && [[ "$line" == *"Type"* ]]; then
+            in_share=1
+            continue
+        fi
+        
+        if [ $in_share -eq 1 ] && [ -n "$line" ]; then
+            [[ "$line" == *"--"* ]] && continue
+            if [[ "$line" == *"Disk"* ]]; then
+                share=$(echo "$line" | awk '{print $1}')
+                [ -n "$share" ] && [ "$share" != "Disk" ] && shares+=("$share")
+            fi
+        fi
+        
+        [[ "$line" == *"blocks"* ]] && in_share=0
+    done <<< "$output"
+    
+    if [ ${#shares[@]} -eq 0 ]; then
+        print_error "No shares found"
+        return 1
+    fi
+    
+    # Display menu
+    echo -e "\n${CYAN}Available shares:${RESET}"
+    for i in "${!shares[@]}"; do
+        smb_url=$(format_smb_url "$TARGET" "${shares[$i]}")
+        echo -e "  ${GRN}$((i+1)))${RESET} $smb_url"
+    done
+    echo -e "  ${RED}$(( ${#shares[@]} + 1 ))) Exit${RESET}"
+    echo
+    
+    # Get user choice
+    while true; do
+        echo -n "Select share (1-$(( ${#shares[@]} + 1 ))): "
+        read -r choice
+        
+        if [[ ! "$choice" =~ ^[0-9]+$ ]]; then
+            print_error "Please enter a number"
+            continue
+        fi
+        
+        if [ "$choice" -lt 1 ] || [ "$choice" -gt $(( ${#shares[@]} + 1 )) ]; then
+            print_error "Invalid choice"
+            continue
+        fi
+        
+        break
+    done
+    
+    # Exit option
+    if [ "$choice" -eq $(( ${#shares[@]} + 1 )) ]; then
+        print_info "Exiting interactive mode"
+        return 0
+    fi
+    
+    # Valid share selected
+    local selected="${shares[$((choice-1))]}"
+    smb_url=$(format_smb_url "$TARGET" "$selected")
+    echo -e "\n${GRN}Connecting to $smb_url...${RESET}"
+    echo -e "${YEL}Type 'help' for commands, 'exit' to quit${RESET}\n"
+    
+    local cmd="smbclient \"//$TARGET/$selected\" $auth"
+    eval $cmd
+}
+
+# ================= SMART ARGUMENT PARSING =================
+parse_arguments() {
+    local args=("$@")
+    
+    if [ ${#args[@]} -lt 1 ]; then
+        print_banner
+        print_help
+        exit 0
+    fi
+    
+    TARGET="${args[0]}"
+    
+    # Check for help
+    if [ "$TARGET" = "-h" ] || [ "$TARGET" = "--help" ] || [ "$TARGET" = "help" ]; then
+        print_banner
+        print_help
+        exit 0
+    fi
+    
+    local i=1
+    local TEMP_LIST=0
+    local TEMP_SHARE=""
+    local INTERACTIVE_FOUND=0
+    local UPLOAD_FOUND=0
+    
+    while [ $i -lt ${#args[@]} ]; do
+        case "${args[$i]}" in
+            -n) NULL_SESSION=1 ;;
+            -r) DO_RESOLVE=1 ;;
+            -o) 
+                OUTPUT="${args[$((i+1))]}"
+                if [ -f "$OUTPUT" ]; then
+                    rm -f "$OUTPUT"
+                fi
+                i=$((i+1))
+                ;;
+            -H) HASH="${args[$((i+1))]}"; i=$((i+1)) ;;
+            -u) USER="${args[$((i+1))]}"; i=$((i+1)) ;;
+            -p) PASS="${args[$((i+1))]}"; i=$((i+1)) ;;
+            -d) DOMAIN="${args[$((i+1))]}"; i=$((i+1)) ;;
+            -h|--help|help) print_banner; print_help; exit 0 ;;
+            
+            -s) 
+                TEMP_LIST=1
+                if [ $((i+1)) -lt ${#args[@]} ] && [[ ! "${args[$((i+1))]}" =~ ^- ]]; then
+                    TEMP_SHARE="${args[$((i+1))]}"
+                    TEMP_SHARE=$(echo "$TEMP_SHARE" | sed 's#^/##')
+                    i=$((i+1))
+                fi
+                ;;
+            -i) 
+                INTERACTIVE_FOUND=1
+                if [ $((i+1)) -lt ${#args[@]} ] && [[ ! "${args[$((i+1))]}" =~ ^- ]]; then
+                    SHARE_NAME="${args[$((i+1))]}"
+                    SHARE_NAME=$(echo "$SHARE_NAME" | sed 's#^/##')
+                    i=$((i+1))
+                fi
+                DOWNLOAD_PATH=""
+                UPLOAD_FOUND=0
+                ;;
+            -get) 
+                OPERATION="download"
+                DOWNLOAD_PATH="${args[$((i+1))]}"
+                DOWNLOAD_PATH=$(echo "$DOWNLOAD_PATH" | sed 's#^/##')
+                i=$((i+1))
+                TEMP_LIST=0
+                INTERACTIVE_FOUND=0
+                UPLOAD_FOUND=0
+                ;;
+            -up) 
+                UPLOAD_FOUND=1
+                OPERATION="upload"
+                # Get source file
+                if [ $((i+1)) -lt ${#args[@]} ] && [[ ! "${args[$((i+1))]}" =~ ^- ]]; then
+                    UPLOAD_SOURCE="${args[$((i+1))]}"
+                    i=$((i+1))
+                else
+                    print_error "-up requires source file and destination path"
+                    exit 1
+                fi
+                # Get destination path
+                if [ $((i+1)) -lt ${#args[@]} ] && [[ ! "${args[$((i+1))]}" =~ ^- ]]; then
+                    UPLOAD_DEST_PATH="${args[$((i+1))]}"
+                    i=$((i+1))
+                else
+                    print_error "-up requires destination path"
+                    exit 1
+                fi
+                TEMP_LIST=0
+                INTERACTIVE_FOUND=0
+                ;;
+            *) print_error "Unknown option: ${args[$i]}"; exit 1 ;;
+        esac
+        i=$((i+1))
+    done
+    
+    if [ "$INTERACTIVE_FOUND" = "1" ]; then
+        OPERATION="interactive"
+        if [ -z "$SHARE_NAME" ] && [ -n "$TEMP_SHARE" ]; then
+            SHARE_NAME="$TEMP_SHARE"
+        fi
+    elif [ "$TEMP_LIST" = "1" ] && [ "$OPERATION" = "none" ] && [ "$UPLOAD_FOUND" = "0" ]; then
+        OPERATION="list"
+        SHARE_NAME="$TEMP_SHARE"
+    fi
+    
+    if [ -n "$HASH" ] && [ -n "$PASS" ]; then
+        PASS=""
+    fi
+    
+    if [ -n "$HASH" ] && [ -z "$USER" ]; then
+        print_error "-H requires -u (username)"
+        exit 1
+    fi
+    
+    if [ -n "$PASS" ] && [ -z "$USER" ]; then
+        print_error "-p requires -u (username)"
+        exit 1
+    fi
+}
+
+# ================= MAIN =================
+main() {
+    parse_arguments "$@"
+    
+    if [ -n "$OUTPUT" ]; then
+        > "$OUTPUT"
+        exec > >(tee "$OUTPUT") 2>&1
+    fi
+    
+    print_banner
+    
+    echo -e "${BOLD}Target:${RESET} $TARGET"
+    [ -n "$USER" ] && echo -e "${BOLD}User:${RESET} $USER"
+    [ -n "$DOMAIN" ] && echo -e "${BOLD}Domain:${RESET} $DOMAIN"
+    if [ -n "$HASH" ]; then
+        if [[ "$HASH" == *":"* ]]; then
+            echo -e "${BOLD}Hash:${RESET} (LM:NT format)"
+        else
+            echo -e "${BOLD}Hash:${RESET} (NT format)"
+        fi
+    fi
+    [ -n "$PASS" ] && echo -e "${BOLD}Password:${RESET} (provided)"
+    
+    if [ "$NULL_SESSION" = "1" ] && [ -z "$USER" ] && [ -z "$HASH" ] && [ -z "$PASS" ]; then
+        echo -e "${BOLD}Mode:${RESET} Null Session"
+    fi
+    
+    [ -n "$OUTPUT" ] && echo -e "${BOLD}Output:${RESET} $OUTPUT"
+    echo
+    
+    check_port || exit 1
+    [ "$DO_RESOLVE" = "1" ] && resolve_hostname
+    
+    case "$OPERATION" in
+        "interactive")
+            interactive_mode
+            ;;
+        "download")
+            download_file
+            ;;
+        "upload")
+            upload_file
+            ;;
+        "list")
+            if [ -n "$SHARE_NAME" ]; then
+                list_content
+            else
+                list_shares
+            fi
+            ;;
+        *)
+            echo -e "\n${YEL}💡 Use -s to list shares or -i for interactive mode${RESET}"
+            ;;
+    esac
+}
+
+main "$@"
+exit 0
+
+
+
+
+
+
+
